@@ -10,9 +10,10 @@ uv
 .env
 .env.*
 
-# Runtime logs
+# Runtime logs & large per-request raw traces
 logs/
 *.log
+requests.jsonl
 
 # OS / editor noise
 .DS_Store

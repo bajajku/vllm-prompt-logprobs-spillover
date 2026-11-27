@@ -1,0 +1,178 @@
+{
+  "run_name": "cal_rps28.00_s101",
+  "timestamp_utc": "2026-11-26T20:46:43Z",
+  "vllm_version": "0.34.0",
+  "model": "Qwen/Qwen2.5-3B-Instruct",
+  "cache_reset_ok": true,
+  "config": {
+    "rps": 28.0,
+    "audit_frac": 0.0,
+    "audit_mode": "uniform",
+    "audit_count_actual": 0,
+    "audit_logprobs_k": 1,
+    "arrival_seed": 101,
+    "num_sessions": 24,
+    "num_turns": 32,
+    "num_streaming_sessions": 16,
+    "init_tokens": 4096,
+    "turn_tokens": 128,
+    "output_tokens": 64,
+    "content_seed": 42
+  },
+  "timing": {
+    "warmup_s": 3.2485178224742413,
+    "schedule_span_s": 28.796316801241513,
+    "wall_s": 31.072009620256722,
+    "achieved_rps": 24.716779165108107
+  },
+  "counts": {
+    "total": 768,
+    "ok": 768,
+    "errors": 0,
+    "streaming_ok": 512,
+    "audited_ok": 0,
+    "control_ok": 256
+  },
+  "streaming_unscored": {
+    "ttft_ms": {
+      "n": 512,
+      "mean": 178.05211207814864,
+      "p50": 118.0199384689331,
+      "p90": 405.8287810534239,
+      "p95": 506.40021217986936,
+      "p99": 603.0594911891966,
+      "max": 670.0199311599135
+    },
+    "e2e_ms": {
+      "n": 512,
+      "mean": 2664.3043736075924,
+      "p50": 2072.229956276715,
+      "p90": 5965.845953486862,
+      "p95": 6894.559848867357,
+      "p99": 7401.358693270013,
+      "max": 7532.394077628851
+    },
+    "tpot_ms": {
+      "n": 512,
+      "mean": 39.55561964427329,
+      "p50": 28.950928124569117,
+      "p90": 89.67070125102528,
+      "p95": 105.3261072929239,
+      "p99": 113.20978106531713,
+      "max": 115.4185277927253
+    },
+    "dispatch_lag_ms": {
+      "n": 512,
+      "mean": 1.5034503412607592,
+      "p50": 0.7485304959118366,
+      "p90": 2.290472667664293,
+      "p95": 4.347977554425594,
+      "p99": 11.777635943144558,
+      "max": 88.43338675796986
+    }
+  },
+  "nonstreaming_audited": {
+    "e2e_ms": {
+      "n": 0,
+      "mean": null,
+      "p50": null,
+      "p90": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+    },
+    "ttfb_ms": {
+      "n": 0,
+      "mean": null,
+      "p50": null,
+      "p90": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+    },
+    "body_transfer_ms": {
+      "n": 0,
+      "mean": null,
+      "p50": null,
+      "p90": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+    },
+    "response_bytes": {
+      "n": 0,
+      "mean": null,
+      "p50": null,
+      "p90": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+    }
+  },
+  "nonstreaming_control": {
+    "e2e_ms": {
+      "n": 256,
+      "mean": 2644.0350615121133,
+      "p50": 1958.7685484439135,
+      "p90": 5775.768362917006,
+      "p95": 6969.517099671066,
+      "p99": 7325.124652637168,
+      "max": 7483.837937004864
+    },
+    "response_bytes": {
+      "n": 256,
+      "mean": 1046.609375,
+      "p50": 619.0,
+      "p90": 624.0,
+      "p95": 631.5,
+      "p99": 14933.099999999642,
+      "max": 45365.0
+    }
+  },
+  "server_metrics": {
+    "prefix_cache_queries": 4767744.0,
+    "prefix_cache_hits": 4669440.0,
+    "reported_cache_hit_ratio": 0.979381443298969,
+    "prompt_tokens_total": 4767744.0,
+    "prompt_tokens_cached_total": 4669440.0,
+    "prompt_tokens_computed_by_source": null,
+    "prefill_kv_computed_tokens_sum": 98304.0,
+    "newly_computed_prefill_tokens": 98304.0,
+    "true_effective_cache_hit_ratio": 0.979381443298969,
+    "generation_tokens_total": 49152.0,
+    "num_preemptions": 0.0,
+    "kv_cache_usage_perc_after": 0.0,
+    "server_ttft_s": {
+      "count": 768.0,
+      "sum": 107.37980389595032,
+      "mean": 0.13981745298951864,
+      "p50": 0.08507462686567165,
+      "p95": 0.44067415730337056,
+      "p99": 0.5899999999999986
+    },
+    "server_queue_s": {
+      "count": 768.0,
+      "sum": 0.013470631092786789,
+      "mean": 1.7539884235399466e-05,
+      "p50": 0.0025,
+      "p95": 0.004749999999999999,
+      "p99": 0.0049499999999999995
+    },
+    "server_prefill_s": {
+      "count": 768.0,
+      "sum": 84.43151782266796,
+      "mean": 0.10993687216493224,
+      "p50": 0.0625,
+      "p95": 0.349411764705882,
+      "p99": 0.4698823529411762
+    },
+    "server_e2e_s": {
+      "count": 768.0,
+      "sum": 2019.1775903701782,
+      "mean": 2.6291374874611697,
+      "p50": 1.9830508474576272,
+      "p95": 8.511627906976742,
+      "p99": 9.702325581395346
+    }
+  }
+}

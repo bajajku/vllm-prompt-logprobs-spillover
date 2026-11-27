@@ -23,6 +23,32 @@ Empirical vLLM `v0.34.0` serving benchmark measuring cross-cohort tail-latency s
   - Client-side per-request TTFT, E2E, TPOT, TTFB, body transfer time, and response payload bytes (`requests.jsonl`).
   - Server-side Prometheus `/metrics` deltas before/after each replay: `vllm:prefix_cache_hits` / `vllm:prefix_cache_queries` (reported hit ratio), `vllm:request_prefill_kv_computed_tokens_sum` & `vllm:prompt_tokens_by_source{source="computed"}` (newly computed prefill tokens), `vllm:num_preemptions`, and fine-grained latency histograms (`server_ttft_s`, `server_queue_s`, `server_prefill_s`, `server_e2e_s`).
 
+## Empirical Results (`vllm==0.34.0`, `Qwen/Qwen2.5-3B-Instruct`, 1× A100-SXM4-80GB)
+
+All **73 benchmark runs** (56,064 total requests across calibration, main sweep, and 3 diagnostic hunts) completed with **0 errors** and **0 KV-cache preemptions**.
+
+- **Baseline Capacity Calibration (0% audit, SLO p95 TTFT ≤ 500 ms):** **`24.0 req/s`** (`p95 = 124.1 ms` at `24 req/s`, crossing the SLO at `28 req/s` with `p95 = 506.4 ms`).
+- **Target 75% Load:** **`18.0 req/s`**.
+
+### Main Sweep: Audit Fraction vs. Unscored Streaming Cohort (`18.0 req/s`, 3 seeds)
+
+![Money Chart](plots/money_chart.png)
+
+| Audit % | Unscored p50 TTFT | Unscored p95 TTFT (mean ± SD) | vs. 0% Baseline | Reported Hit % | True Effective Hit % | Newly Computed Prefill |
+|---:|---:|---:|---:|---:|---:|---:|
+| **0%** | 61.6 ms | **93.8 ± 9.1 ms** | +0.0% | **97.94%** | 97.94% | 98,304 tok (1.0×) |
+| **1%** | 64.6 ms | **244.3 ± 34.5 ms** | **+160.3%** | **97.94%** | 96.98% | 144,000 tok (1.5×) |
+| **5%** | 164.6 ms | **757.0 ± 212.0 ms** | **+706.6%** | **97.94%** | 93.16% | 326,144 tok (3.3×) |
+| **10%** | 440.3 ms | **10,209.7 ± 1,615.3 ms** | **+10,778.9%** | **97.94%** | 88.00% | 572,160 tok (5.8×) |
+
+**Hypothesis verdict — strongly confirmed:** At 75% load, auditing **5% of turns** raised unscored streaming **p95 TTFT by +706.6% (8.1×)** while newly computed prefill tokens jumped **3.3×** and the reported prefix-cache hit rate moved by **0.00 percentage points (`97.94% → 97.94%`)**.
+
+### Diagnostic Hunts
+
+1. **Hunt 1 — Early vs. Late Turns ([hunt1_early_vs_late.png](plots/hunt1_early_vs_late.png)):** Auditing just **10 late turns** (1.3% of turns, `176K` new prefill tokens) raised unscored p95 TTFT to **665.9 ms (+592.3%)**—worse than auditing **24 early turns** (3.1% of turns, `209K` new prefill tokens, **422.4 ms / +339.1%**).
+2. **Hunt 2 — GPU Contention vs. Logprob Serialization ([hunt2_serialization_gap.png](plots/hunt2_serialization_gap.png)):** Even at `prompt_logprobs=0` (`0.47 MB` payload), server Prometheus p95 TTFT jumped **10×** (`72.5 ms → 745.5 ms`, client p95 `856.8 ms`), proving GPU prefill/queue contention is the primary driver. Increasing to `k=5` (`2.41 MB` payload) kept server TTFT flat (`715.5 ms`) while pushing client p95 to `1,030.9 ms` and client p50 from `162.5 ms → 377.5 ms`, exposing a secondary API-server JSON serialization stall.
+3. **Hunt 3 — Load Boundary ([hunt3_load_boundary.png](plots/hunt3_load_boundary.png)):** 5% auditing severely degraded unscored p95 TTFT across every tested load: **+388.5%** at 35% load (`70.0 → 341.9 ms`), **+455.6%** at 50% load (`75.1 → 417.5 ms`), **+682.4%** at 75% load (`97.7 → 764.3 ms`), and **+869.5%** at 90% load (`172.1 → 1,668.0 ms`).
+
 ## Environment Requirements
 
 - Linux host with 1× NVIDIA A100-SXM4-80GB (or comparable GPU; configurable via `GPU_ID`)
