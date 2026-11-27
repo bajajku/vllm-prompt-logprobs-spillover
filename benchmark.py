@@ -14,6 +14,8 @@ import argparse
 import asyncio
 import json
 import math
+import multiprocessing
+from multiprocessing.connection import wait as mp_wait
 import os
 import random
 import re
@@ -31,16 +33,19 @@ PROM_LINE_RE = re.compile(
     r'^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{([^}]*)\})?\s+([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?|[+-]?Inf|NaN)$'
 )
 LABEL_RE = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\.|[^"\\])*)"')
+_WARMED_LOGPROBS_KS: set[int] = set()
 
 
 @dataclass(frozen=True)
 class TurnSpec:
     seq_idx: int
     session_id: int
-    turn_idx: int
+    step_idx: int
+    turn_depth: int  # Logical conversation depth in 0..num_turns-1 (stationary when staggered)
     scheduled_s: float
     cohort: str  # "streaming_unscored" | "nonstreaming_pool"
     audited: bool
+    audit_action: str  # "none" | "logprobs" | "cache_miss"
     stream: bool
     prompt_len: int
     output_tokens: int
@@ -199,35 +204,80 @@ def summarize_metrics_delta(
     }
 
 
-def generate_session_tokens(
+def compute_session_phases(num_sessions: int, num_turns: int, num_streaming_sessions: int) -> list[int]:
+    """
+    Assign staggered initial turn depths per session so that the aggregate
+    prompt-length distribution is stationary across the entire replay window,
+    uniformly covering depths 0..num_turns-1 in both cohorts.
+    """
+    phases = [0] * num_sessions
+    for i in range(num_streaming_sessions):
+        phases[i] = (i * num_turns) // max(1, num_streaming_sessions)
+    pool_n = num_sessions - num_streaming_sessions
+    for j in range(pool_n):
+        offset = max(1, num_turns // max(1, 2 * pool_n))
+        phases[num_streaming_sessions + j] = ((j * num_turns) // max(1, pool_n) + offset) % num_turns
+    return phases
+
+
+def generate_session_prompts(
     num_sessions: int,
     num_turns: int,
+    num_streaming_sessions: int,
     init_tokens: int,
     turn_tokens: int,
     content_seed: int = 42,
     vocab_lo: int = 1000,
     vocab_hi: int = 100000,
-) -> tuple[list[list[int]], list[list[list[int]]]]:
+) -> tuple[list[list[int]], list[list[list[int]]], list[int]]:
     """
-    Generate deterministic, distinct per-session token histories and per-turn increments.
-    Each session starts with a distinct `init_tokens` (4096) prefix (guaranteed zero
-    cross-session prefix collision) and appends `turn_tokens` (128) new tokens per turn.
+    Generate deterministic, distinct per-session staggered conversations.
+
+    Each session `s` starts at staggered depth `phase[s]` with a pre-primed
+    conversation A of length `init_tokens + phase[s] * turn_tokens`. Once it
+    reaches depth `num_turns - 1`, it rolls over to a second pre-primed 4K
+    conversation B (`init_tokens`) so every single baseline turn hits the
+    prefix cache and computes exactly `turn_tokens` (128) new tokens, while
+    keeping the aggregate prompt-length distribution stationary across time.
     """
     rng = np.random.default_rng(content_seed)
-    init_histories: list[list[int]] = []
-    turn_chunks: list[list[list[int]]] = []
+    phases = compute_session_phases(num_sessions, num_turns, num_streaming_sessions)
+    warmup_prefixes: list[list[int]] = []
+    prompts: list[list[list[int]]] = []
+
     for s in range(num_sessions):
-        # Embed a unique session signature in the first 16-token block so prefixes never collide.
-        prefix = rng.integers(vocab_lo, vocab_hi, size=init_tokens, dtype=np.int64)
-        prefix[0] = vocab_lo + s
-        prefix[1] = vocab_lo + 500 + s
-        init_histories.append(prefix.tolist())
-        chunks = [
-            rng.integers(vocab_lo, vocab_hi, size=turn_tokens, dtype=np.int64).tolist()
-            for _ in range(num_turns)
-        ]
-        turn_chunks.append(chunks)
-    return init_histories, turn_chunks
+        p = phases[s]
+        # Conversation A: already at depth `p` when replay starts.
+        len_a = init_tokens + p * turn_tokens
+        init_a = rng.integers(vocab_lo, vocab_hi, size=len_a, dtype=np.int64)
+        init_a[0] = vocab_lo + s
+        init_a[1] = vocab_lo + 500 + s
+        init_a_list = init_a.tolist()
+        warmup_prefixes.append(init_a_list)
+
+        # Conversation B: fresh 4K history used after rollover (only needed when p > 0).
+        init_b_list: list[int] | None = None
+        if p > 0:
+            init_b = rng.integers(vocab_lo, vocab_hi, size=init_tokens, dtype=np.int64)
+            init_b[0] = vocab_lo + 2000 + s
+            init_b[1] = vocab_lo + 2500 + s
+            init_b_list = init_b.tolist()
+            warmup_prefixes.append(init_b_list)
+
+        s_prompts: list[list[int]] = []
+        acc_a = list(init_a_list)
+        acc_b = list(init_b_list) if init_b_list is not None else []
+        for step in range(num_turns):
+            chunk = rng.integers(vocab_lo, vocab_hi, size=turn_tokens, dtype=np.int64).tolist()
+            if p + step < num_turns:
+                acc_a = acc_a + chunk
+                s_prompts.append(acc_a)
+            else:
+                acc_b = acc_b + chunk
+                s_prompts.append(acc_b)
+        prompts.append(s_prompts)
+
+    return warmup_prefixes, prompts, phases
 
 
 def build_schedule(
@@ -242,19 +292,25 @@ def build_schedule(
     output_tokens: int,
     init_tokens: int,
     turn_tokens: int,
-    audit_seed: int = 999,
+    audit_seed: int | None = None,
+    audit_action: str = "logprobs",
 ) -> list[TurnSpec]:
     """
     Build a fixed open-loop replay schedule:
     - Stationary Poisson aggregate arrival timestamps at rate `rps` (seeded by `arrival_seed`).
     - Round-robin turn-shuffled session assignment with boundary separation so consecutive
       turns of the same session do not arrive back-to-back and there is no tail ramp-down.
+    - Staggered session turn depths so prompt lengths are stationary over the run.
     - Fixed streaming cohort (`sessions 0..num_streaming_sessions-1`) that is NEVER audited.
-    - Nonstreaming pool (`sessions num_streaming_sessions..num_sessions-1`) where both
-      audited turns and their matched controls use `stream=False`.
-    - Strictly nested audit subsets for `uniform` mode (`1% ⊂ 5% ⊂ 10%`).
+    - Nonstreaming pool (`sessions num_streaming_sessions..num_sessions-1`) where audited turns
+      and their matched controls all use `stream=False`.
+    - Strictly nested audit subsets per replicate (`1% ⊂ 5% ⊂ 10%`), with `audit_seed`
+      varying across replicates (`9000 + arrival_seed` by default).
     """
     total_turns = num_sessions * num_turns
+    phases = compute_session_phases(num_sessions, num_turns, num_streaming_sessions)
+    effective_audit_seed = (9000 + arrival_seed) if audit_seed is None else audit_seed
+
     rng_arr = random.Random(arrival_seed)
     np_rng = np.random.default_rng(arrival_seed)
 
@@ -263,11 +319,11 @@ def build_schedule(
     timestamps = np.cumsum(inter_arrivals)
     timestamps = timestamps - timestamps[0]
 
-    # Order sessions per turn round, avoiding back-to-back session repeats across turn boundaries.
+    # Order sessions per turn round, avoiding back-to-back session repeats across round boundaries.
     order: list[tuple[int, int]] = []
     prev_tail: set[int] = set()
     sep = min(4, num_sessions // 3)
-    for t in range(num_turns):
+    for step in range(num_turns):
         sess = list(range(num_sessions))
         for _ in range(50):
             rng_arr.shuffle(sess)
@@ -275,31 +331,32 @@ def build_schedule(
                 break
         prev_tail = set(sess[-sep:]) if sep > 0 else set()
         for s in sess:
-            order.append((s, t))
+            order.append((s, step))
 
-    # Determine which (session_id, turn_idx) pairs are audited from the nonstreaming pool.
+    # Determine which (session_id, step_idx) pairs are audited from the nonstreaming pool.
     pool_sessions = list(range(num_streaming_sessions, num_sessions))
-    rng_aud = random.Random(audit_seed)
+    rng_aud = random.Random(effective_audit_seed)
     audited_set: set[tuple[int, int]] = set()
 
     if audit_mode == "uniform":
         target_n = audit_count if audit_count is not None else int(round(audit_frac * total_turns))
-        # Stratified-shuffled permutation across turn depths so 1% ⊂ 5% ⊂ 10% evenly spans all turns.
-        buckets: list[list[tuple[int, int]]] = []
-        for t in range(num_turns):
-            b = [(s, t) for s in pool_sessions]
-            rng_aud.shuffle(b)
-            buckets.append(b)
+        # Stratified-shuffled permutation across logical turn depths so 1% ⊂ 5% ⊂ 10%
+        # evenly spans early/mid/late prompt lengths AND wall-clock time.
+        by_depth: dict[int, list[tuple[int, int]]] = {d: [] for d in range(num_turns)}
+        for s in pool_sessions:
+            for step in range(num_turns):
+                depth = (phases[s] + step) % num_turns
+                by_depth[depth].append((s, step))
+        for d in range(num_turns):
+            rng_aud.shuffle(by_depth[d])
         ranked: list[tuple[int, int]] = []
-        turn_order = list(range(num_turns))
-        rng_aud.shuffle(turn_order)
+        depth_order = list(range(num_turns))
+        rng_aud.shuffle(depth_order)
         for slot in range(len(pool_sessions)):
-            # Stride through turn_order so even small counts (e.g., 1%) span early/mid/late turns.
             for idx in range(num_turns):
-                t = turn_order[(idx * 7 + slot * 3) % num_turns]
-                if slot < len(buckets[t]):
-                    ranked.append(buckets[t][slot])
-        # Deduplicate while preserving order.
+                d = depth_order[(idx * 7 + slot * 3) % num_turns]
+                if slot < len(by_depth[d]):
+                    ranked.append(by_depth[d][slot])
         seen: set[tuple[int, int]] = set()
         unique_ranked = []
         for item in ranked:
@@ -310,8 +367,13 @@ def build_schedule(
             raise ValueError(f"Requested {target_n} audits, but nonstreaming pool only has {len(unique_ranked)} turns.")
         audited_set = set(unique_ranked[:target_n])
     elif audit_mode in ("early", "late"):
-        turn_range = range(0, min(8, num_turns)) if audit_mode == "early" else range(max(0, num_turns - 8), num_turns)
-        candidates = [(s, t) for t in turn_range for s in pool_sessions]
+        depth_range = set(range(0, min(8, num_turns))) if audit_mode == "early" else set(range(max(0, num_turns - 8), num_turns))
+        candidates = [
+            (s, step)
+            for s in pool_sessions
+            for step in range(num_turns)
+            if ((phases[s] + step) % num_turns) in depth_range
+        ]
         rng_aud.shuffle(candidates)
         target_n = audit_count if audit_count is not None else int(round(audit_frac * total_turns))
         if target_n > len(candidates):
@@ -321,20 +383,23 @@ def build_schedule(
         raise ValueError(f"Unknown audit_mode: {audit_mode}")
 
     specs: list[TurnSpec] = []
-    for seq_idx, ((s, t), ts) in enumerate(zip(order, timestamps)):
+    for seq_idx, ((s, step), ts) in enumerate(zip(order, timestamps)):
         is_streaming = s < num_streaming_sessions
-        is_audited = (s, t) in audited_set
+        is_audited = (s, step) in audited_set
+        depth = (phases[s] + step) % num_turns
         assert not (is_streaming and is_audited), "Streaming cohort must never be audited."
         specs.append(
             TurnSpec(
                 seq_idx=seq_idx,
                 session_id=s,
-                turn_idx=t,
+                step_idx=step,
+                turn_depth=depth,
                 scheduled_s=float(ts),
                 cohort="streaming_unscored" if is_streaming else "nonstreaming_pool",
                 audited=is_audited,
+                audit_action=audit_action if is_audited else "none",
                 stream=is_streaming,
-                prompt_len=init_tokens + (t + 1) * turn_tokens,
+                prompt_len=init_tokens + (depth + 1) * turn_tokens,
                 output_tokens=output_tokens,
             )
         )
@@ -356,24 +421,61 @@ async def reset_prefix_cache(client: httpx.AsyncClient, base_url: str) -> bool:
         return False
 
 
+async def warmup_logprobs_kernels(
+    client: httpx.AsyncClient,
+    base_url: str,
+    model: str,
+    ks: tuple[int, ...] = (0, 1, 5),
+    prompt_lens: tuple[int, ...] = (4224, 8192),
+) -> float:
+    """
+    Pre-compile vLLM Triton/Torch prompt_logprobs kernels (e.g., _topk_log_softmax_kernel)
+    before resetting the prefix cache or starting timed measurement runs.
+    """
+    missing = [k for k in sorted(set(ks)) if k not in _WARMED_LOGPROBS_KS]
+    if not missing:
+        return 0.0
+    t0 = time.monotonic()
+    rng = np.random.default_rng(777)
+    for k in missing:
+        for idx, plen in enumerate(prompt_lens):
+            prompt_ids = rng.integers(1000, 50000, size=plen, dtype=np.int64)
+            prompt_ids[0] = 109000 + k * 10 + idx
+            payload = {
+                "model": model,
+                "prompt": prompt_ids.tolist(),
+                "max_tokens": 2,
+                "temperature": 0.0,
+                "repetition_penalty": 1.0,
+                "ignore_eos": True,
+                "stream": False,
+                "prompt_logprobs": k,
+            }
+            resp = await client.post(f"{base_url}/v1/completions", json=payload, timeout=180.0)
+            resp.raise_for_status()
+        _WARMED_LOGPROBS_KS.add(k)
+    return time.monotonic() - t0
+
+
 async def warmup_sessions(
     client: httpx.AsyncClient,
     base_url: str,
     model: str,
-    init_histories: list[list[int]],
+    warmup_prefixes: list[list[int]],
     warmup_output_tokens: int = 8,
     concurrency: int = 6,
 ) -> float:
-    """Prime all 24 sessions' 4K starting histories into the KV prefix cache."""
+    """Prime all staggered starting histories (and rollover bases) into the KV prefix cache."""
     sem = asyncio.Semaphore(concurrency)
-    t0 = time.perf_counter()
+    t0 = time.monotonic()
 
-    async def prime_one(s_id: int, prompt_ids: list[int]) -> None:
+    async def prime_one(prompt_ids: list[int]) -> None:
         payload = {
             "model": model,
             "prompt": prompt_ids,
             "max_tokens": warmup_output_tokens,
             "temperature": 0.0,
+            "repetition_penalty": 1.0,
             "ignore_eos": True,
             "stream": False,
         }
@@ -381,8 +483,8 @@ async def warmup_sessions(
             resp = await client.post(f"{base_url}/v1/completions", json=payload, timeout=180.0)
             resp.raise_for_status()
 
-    await asyncio.gather(*(prime_one(s, h) for s, h in enumerate(init_histories)))
-    return time.perf_counter() - t0
+    await asyncio.gather(*(prime_one(h) for h in warmup_prefixes))
+    return time.monotonic() - t0
 
 
 async def send_turn(
@@ -393,32 +495,46 @@ async def send_turn(
     prompt_ids: list[int],
     audit_logprobs_k: int,
     t_run_start: float,
-) -> dict[str, Any]:
-    """Sleep until scheduled open-loop arrival time, then send request and record latencies."""
-    now = time.perf_counter()
+) -> tuple[dict[str, Any], bytes | None]:
+    """
+    Sleep until scheduled open-loop arrival time, then send request and record latencies.
+    For nonstreaming requests, JSON decoding is strictly deferred post-run so large
+    prompt_logprobs payloads never block the asyncio event loop during live replay.
+    """
+    now = time.monotonic()
     delay = (t_run_start + spec.scheduled_s) - now
     if delay > 0:
         await asyncio.sleep(delay)
 
-    t_send = time.perf_counter()
+    t_send = time.monotonic()
     dispatch_lag_ms = (t_send - (t_run_start + spec.scheduled_s)) * 1000.0
+
+    # For cache_miss-only control, mutate token 0 to a unique uncached token ID
+    # (outside [1000, 100000) and within Qwen2.5 vocab) without requesting prompt_logprobs.
+    effective_prompt = prompt_ids
+    if spec.audited and spec.audit_action == "cache_miss":
+        effective_prompt = list(prompt_ids)
+        effective_prompt[0] = 100500 + spec.seq_idx
+
     payload: dict[str, Any] = {
         "model": model,
-        "prompt": prompt_ids,
+        "prompt": effective_prompt,
         "max_tokens": spec.output_tokens,
         "temperature": 0.0,
+        "repetition_penalty": 1.0,
         "ignore_eos": True,
         "stream": spec.stream,
     }
     if spec.stream:
         payload["stream_options"] = {"include_usage": True}
-    if spec.audited:
+    if spec.audited and spec.audit_action == "logprobs":
         payload["prompt_logprobs"] = audit_logprobs_k
 
     record: dict[str, Any] = asdict(spec)
     record["dispatch_lag_ms"] = dispatch_lag_ms
-    record["audit_logprobs_k"] = audit_logprobs_k if spec.audited else None
+    record["audit_logprobs_k"] = audit_logprobs_k if (spec.audited and spec.audit_action == "logprobs") else None
     record["t_send_rel_s"] = t_send - t_run_start
+    raw_body: bytes | None = None
 
     try:
         if spec.stream:
@@ -430,12 +546,12 @@ async def send_turn(
             async with client.stream(
                 "POST", f"{base_url}/v1/completions", json=payload, timeout=300.0
             ) as resp:
-                t_headers = time.perf_counter()
+                t_headers = time.monotonic()
                 record["http_status"] = resp.status_code
                 if resp.status_code != 200:
                     body = await resp.aread()
                     record["error"] = body.decode("utf-8", errors="replace")[:500]
-                    return record
+                    return record, None
                 async for line in resp.aiter_lines():
                     resp_bytes += len(line) + 1
                     if not line.startswith("data:"):
@@ -452,14 +568,15 @@ async def send_turn(
                         if txt is not None and txt != "":
                             chunk_count += 1
                             if t_first is None:
-                                t_first = time.perf_counter()
-            t_end = time.perf_counter()
+                                t_first = time.monotonic()
+            t_end = time.monotonic()
+            comp_tokens = usage.get("completion_tokens") or chunk_count
             record["ttfb_ms"] = (t_headers - t_send) * 1000.0 if t_headers else None
             record["ttft_ms"] = (t_first - t_send) * 1000.0 if t_first else None
             record["e2e_ms"] = (t_end - t_send) * 1000.0
             record["tpot_ms"] = (
-                ((t_end - t_first) * 1000.0 / max(1, chunk_count - 1))
-                if (t_first and chunk_count > 1)
+                ((t_end - t_first) * 1000.0 / (comp_tokens - 1))
+                if (t_first is not None and comp_tokens and comp_tokens > 1)
                 else None
             )
             record["response_bytes"] = resp_bytes
@@ -472,9 +589,9 @@ async def send_turn(
             async with client.stream(
                 "POST", f"{base_url}/v1/completions", json=payload, timeout=300.0
             ) as resp:
-                t_headers = time.perf_counter()
+                t_headers = time.monotonic()
                 body = await resp.aread()
-                t_end = time.perf_counter()
+                t_end = time.monotonic()
                 record["http_status"] = resp.status_code
                 record["response_bytes"] = len(body)
                 record["ttfb_ms"] = (t_headers - t_send) * 1000.0
@@ -482,20 +599,151 @@ async def send_turn(
                 record["body_transfer_ms"] = (t_end - t_headers) * 1000.0
                 if resp.status_code != 200:
                     record["error"] = body.decode("utf-8", errors="replace")[:500]
-                    return record
-                obj = json.loads(body)
-                usage = obj.get("usage") or {}
-                record["prompt_tokens"] = usage.get("prompt_tokens")
-                record["completion_tokens"] = usage.get("completion_tokens")
-                ptd = usage.get("prompt_tokens_details") or {}
-                record["cached_tokens"] = ptd.get("cached_tokens")
-                choices = obj.get("choices") or []
-                if choices and choices[0].get("prompt_logprobs") is not None:
-                    record["prompt_logprobs_len"] = len(choices[0]["prompt_logprobs"])
+                    return record, None
+                raw_body = body
     except Exception as exc:
         record["http_status"] = -1
         record["error"] = repr(exc)
+    return record, raw_body
+
+
+def _parse_nonstreaming_body(record: dict[str, Any], raw_body: bytes | None) -> dict[str, Any]:
+    """Post-run JSON parse for nonstreaming responses (off the live replay critical path)."""
+    if raw_body is None:
+        return record
+    try:
+        obj = json.loads(raw_body)
+        usage = obj.get("usage") or {}
+        record["prompt_tokens"] = usage.get("prompt_tokens")
+        record["completion_tokens"] = usage.get("completion_tokens")
+        ptd = usage.get("prompt_tokens_details") or {}
+        record["cached_tokens"] = ptd.get("cached_tokens")
+        choices = obj.get("choices") or []
+        if choices and choices[0].get("prompt_logprobs") is not None:
+            record["prompt_logprobs_len"] = len(choices[0]["prompt_logprobs"])
+    except Exception as exc:
+        record["parse_error"] = repr(exc)
     return record
+
+
+def _cohort_worker_main(
+    conn: Any,
+    base_url: str,
+    model: str,
+    specs: list[TurnSpec],
+    audit_logprobs_k: int,
+    num_sessions: int,
+    num_turns: int,
+    num_streaming_sessions: int,
+    init_tokens: int,
+    turn_tokens: int,
+    content_seed: int,
+) -> None:
+    """
+    Isolated OS process for a single cohort (either streaming_unscored or nonstreaming_pool),
+    eliminating any client-side event-loop, GC, or JSON-parsing cross-talk between cohorts.
+    """
+    _, prompts, _ = generate_session_prompts(
+        num_sessions=num_sessions,
+        num_turns=num_turns,
+        num_streaming_sessions=num_streaming_sessions,
+        init_tokens=init_tokens,
+        turn_tokens=turn_tokens,
+        content_seed=content_seed,
+    )
+
+    async def _run() -> list[dict[str, Any]]:
+        limits = httpx.Limits(max_connections=512, max_keepalive_connections=256)
+        async with httpx.AsyncClient(limits=limits) as client:
+            conn.send("READY")
+            t_run_start = float(conn.recv())
+            tasks = [
+                asyncio.create_task(
+                    send_turn(
+                        client=client,
+                        base_url=base_url,
+                        model=model,
+                        spec=spec,
+                        prompt_ids=prompts[spec.session_id][spec.step_idx],
+                        audit_logprobs_k=audit_logprobs_k,
+                        t_run_start=t_run_start,
+                    )
+                )
+                for spec in specs
+            ]
+            raw_results = await asyncio.gather(*tasks)
+        # Parse all nonstreaming JSON bodies AFTER replay finishes.
+        return [_parse_nonstreaming_body(rec, body) for rec, body in raw_results]
+
+    records = asyncio.run(_run())
+    conn.send(records)
+    conn.close()
+
+
+def replay_isolated_cohorts(
+    *,
+    base_url: str,
+    model: str,
+    specs: list[TurnSpec],
+    audit_logprobs_k: int,
+    num_sessions: int,
+    num_turns: int,
+    num_streaming_sessions: int,
+    init_tokens: int,
+    turn_tokens: int,
+    content_seed: int,
+) -> tuple[list[dict[str, Any]], float]:
+    """Run streaming and nonstreaming cohorts in separate OS processes synced on CLOCK_MONOTONIC."""
+    streaming_specs = [s for s in specs if s.stream]
+    nonstreaming_specs = [s for s in specs if not s.stream]
+
+    ctx = multiprocessing.get_context("spawn")
+    parent_s, child_s = ctx.Pipe()
+    parent_n, child_n = ctx.Pipe()
+
+    common_args = (
+        base_url,
+        model,
+    )
+    tail_args = (
+        audit_logprobs_k,
+        num_sessions,
+        num_turns,
+        num_streaming_sessions,
+        init_tokens,
+        turn_tokens,
+        content_seed,
+    )
+    proc_s = ctx.Process(target=_cohort_worker_main, args=(child_s, *common_args, streaming_specs, *tail_args))
+    proc_n = ctx.Process(target=_cohort_worker_main, args=(child_n, *common_args, nonstreaming_specs, *tail_args))
+    proc_s.start()
+    proc_n.start()
+    child_s.close()
+    child_n.close()
+
+    # Wait for both processes to finish prompt setup and open HTTP pools.
+    assert parent_s.recv() == "READY"
+    assert parent_n.recv() == "READY"
+    t_run_start = time.monotonic() + 0.5
+    parent_s.send(t_run_start)
+    parent_n.send(t_run_start)
+
+    records: list[dict[str, Any]] = []
+    pending = [parent_s, parent_n]
+    while pending:
+        for ready_conn in mp_wait(pending):
+            records.extend(ready_conn.recv())
+            ready_conn.close()
+            pending.remove(ready_conn)
+
+    wall_s = time.monotonic() - t_run_start
+    proc_s.join()
+    proc_n.join()
+    if proc_s.exitcode != 0 or proc_n.exitcode != 0:
+        raise RuntimeError(f"Cohort worker failed: streaming={proc_s.exitcode}, nonstreaming={proc_n.exitcode}")
+
+    records.sort(key=lambda r: r["seq_idx"])
+    return records, wall_s
 
 
 def percentile_stats(values: list[float]) -> dict[str, float | int | None]:
@@ -521,8 +769,10 @@ async def run_single(
     audit_frac: float,
     arrival_seed: int,
     audit_mode: str = "uniform",
+    audit_action: str = "logprobs",
     audit_count: int | None = None,
     audit_logprobs_k: int = 1,
+    audit_seed: int | None = None,
     num_sessions: int = 24,
     num_turns: int = 32,
     num_streaming_sessions: int = 16,
@@ -533,23 +783,16 @@ async def run_single(
     out_dir: Path,
     run_name: str,
 ) -> dict[str, Any]:
-    """Execute one full benchmark run (reset -> warmup -> replay -> metrics summary)."""
-    init_histories, turn_chunks = generate_session_tokens(
+    """Execute one full benchmark run (JIT warmup -> reset -> prefix warmup -> isolated replay -> metrics)."""
+    effective_audit_seed = (9000 + arrival_seed) if audit_seed is None else audit_seed
+    warmup_prefixes, _, phases = generate_session_prompts(
         num_sessions=num_sessions,
         num_turns=num_turns,
+        num_streaming_sessions=num_streaming_sessions,
         init_tokens=init_tokens,
         turn_tokens=turn_tokens,
         content_seed=content_seed,
     )
-    # Pre-build exact cumulative token prompts per (session, turn) once in memory.
-    prompts: list[list[list[int]]] = []
-    for s in range(num_sessions):
-        s_prompts: list[list[int]] = []
-        acc = list(init_histories[s])
-        for t in range(num_turns):
-            acc = acc + turn_chunks[s][t]
-            s_prompts.append(acc)
-        prompts.append(s_prompts)
 
     specs = build_schedule(
         num_sessions=num_sessions,
@@ -563,11 +806,12 @@ async def run_single(
         output_tokens=output_tokens,
         init_tokens=init_tokens,
         turn_tokens=turn_tokens,
+        audit_seed=effective_audit_seed,
+        audit_action=audit_action,
     )
 
-    limits = httpx.Limits(max_connections=512, max_keepalive_connections=256)
+    limits = httpx.Limits(max_connections=128, max_keepalive_connections=64)
     async with httpx.AsyncClient(limits=limits) as client:
-        # Query vLLM version for reproducibility provenance.
         vllm_ver = None
         try:
             vr = await client.get(f"{base_url}/version", timeout=10.0)
@@ -576,28 +820,33 @@ async def run_single(
         except Exception:
             pass
 
+        # Pre-warm Triton logprobs kernels once per process before cache reset / timing.
+        jit_warmup_s = await warmup_logprobs_kernels(
+            client,
+            base_url,
+            model,
+            ks=tuple(sorted({0, 1, 5, audit_logprobs_k})),
+        )
         cache_reset_ok = await reset_prefix_cache(client, base_url)
-        warmup_s = await warmup_sessions(client, base_url, model, init_histories)
+        warmup_s = await warmup_sessions(client, base_url, model, warmup_prefixes)
         await asyncio.sleep(2.0)
         metrics_before = await fetch_metrics(client, base_url)
 
-        t_run_start = time.perf_counter() + 0.5
-        tasks = [
-            asyncio.create_task(
-                send_turn(
-                    client=client,
-                    base_url=base_url,
-                    model=model,
-                    spec=spec,
-                    prompt_ids=prompts[spec.session_id][spec.turn_idx],
-                    audit_logprobs_k=audit_logprobs_k,
-                    t_run_start=t_run_start,
-                )
-            )
-            for spec in specs
-        ]
-        records = await asyncio.gather(*tasks)
-        wall_s = time.perf_counter() - t_run_start
+    # Run streaming and nonstreaming cohorts in separate OS processes to prevent client cross-talk.
+    records, wall_s = replay_isolated_cohorts(
+        base_url=base_url,
+        model=model,
+        specs=specs,
+        audit_logprobs_k=audit_logprobs_k,
+        num_sessions=num_sessions,
+        num_turns=num_turns,
+        num_streaming_sessions=num_streaming_sessions,
+        init_tokens=init_tokens,
+        turn_tokens=turn_tokens,
+        content_seed=content_seed,
+    )
+
+    async with httpx.AsyncClient(limits=limits) as client:
         await asyncio.sleep(2.0)
         metrics_after = await fetch_metrics(client, base_url)
 
@@ -607,6 +856,7 @@ async def run_single(
     streaming_ok = [r for r in ok_records if r["cohort"] == "streaming_unscored"]
     audited_ok = [r for r in ok_records if r["audited"]]
     control_ok = [r for r in ok_records if r["cohort"] == "nonstreaming_pool" and not r["audited"]]
+    achieved_rps = len(ok_records) / wall_s if wall_s > 0 else 0.0
 
     summary: dict[str, Any] = {
         "run_name": run_name,
@@ -618,9 +868,14 @@ async def run_single(
             "rps": rps,
             "audit_frac": audit_frac,
             "audit_mode": audit_mode,
+            "audit_action": audit_action,
             "audit_count_actual": sum(1 for s in specs if s.audited),
             "audit_logprobs_k": audit_logprobs_k,
             "arrival_seed": arrival_seed,
+            "audit_seed": effective_audit_seed,
+            "staggered_depths": True,
+            "session_phases": phases,
+            "isolated_cohort_processes": True,
             "num_sessions": num_sessions,
             "num_turns": num_turns,
             "num_streaming_sessions": num_streaming_sessions,
@@ -630,10 +885,12 @@ async def run_single(
             "content_seed": content_seed,
         },
         "timing": {
+            "jit_warmup_s": jit_warmup_s,
             "warmup_s": warmup_s,
             "schedule_span_s": specs[-1].scheduled_s if specs else 0.0,
             "wall_s": wall_s,
-            "achieved_rps": len(ok_records) / wall_s if wall_s > 0 else 0.0,
+            "achieved_rps": achieved_rps,
+            "unstable_overloaded": achieved_rps < 0.90 * rps,
         },
         "counts": {
             "total": len(records),
@@ -658,12 +915,14 @@ async def run_single(
             "response_bytes": percentile_stats(
                 [float(r["response_bytes"]) for r in audited_ok if r.get("response_bytes") is not None]
             ),
+            "dispatch_lag_ms": percentile_stats([r["dispatch_lag_ms"] for r in audited_ok]),
         },
         "nonstreaming_control": {
             "e2e_ms": percentile_stats([r["e2e_ms"] for r in control_ok if r.get("e2e_ms") is not None]),
             "response_bytes": percentile_stats(
                 [float(r["response_bytes"]) for r in control_ok if r.get("response_bytes") is not None]
             ),
+            "dispatch_lag_ms": percentile_stats([r["dispatch_lag_ms"] for r in control_ok]),
         },
         "server_metrics": metrics_delta,
     }
@@ -677,6 +936,7 @@ async def run_single(
             f.write(json.dumps(r) + "\n")
 
     st = summary["streaming_unscored"]["ttft_ms"]
+    dl = summary["streaming_unscored"]["dispatch_lag_ms"]
     sm = summary["server_metrics"]
     hit_pct = (sm["reported_cache_hit_ratio"] * 100.0) if sm["reported_cache_hit_ratio"] is not None else float("nan")
     true_pct = (
@@ -685,11 +945,13 @@ async def run_single(
         else float("nan")
     )
     prefill_tok = sm["newly_computed_prefill_tokens"] or 0.0
+    flag = " [UNSTABLE]" if summary["timing"]["unstable_overloaded"] else ""
     print(
         f"[{run_name}] ok={len(ok_records)}/{len(records)} | "
         f"unscored p50={st['p50']:.1f}ms p95={st['p95']:.1f}ms p99={st['p99']:.1f}ms | "
+        f"dlag_p95={dl['p95']:.1f}ms | "
         f"reported_hit={hit_pct:.2f}% true_hit={true_pct:.2f}% | "
-        f"new_prefill={prefill_tok:,.0f} | wall={wall_s:.1f}s"
+        f"new_prefill={prefill_tok:,.0f} | wall={wall_s:.1f}s{flag}"
     )
     return summary
 
@@ -834,9 +1096,25 @@ async def run_hunts(args: argparse.Namespace) -> None:
                     audit_frac=0.0,
                     arrival_seed=seed,
                     audit_mode="uniform",
+                    audit_action="logprobs",
                     audit_logprobs_k=1,
                     out_dir=out_dir,
                     run_name=f"baseline_0pct_s{seed}",
+                )
+            )
+            # 5% cache-miss-only control: identical audited turns with token 0 mutated,
+            # prompt_logprobs unset -> isolates pure prefix-cache bypass from lm_head/log_softmax/serialization.
+            runs.append(
+                await run_single(
+                    **common,
+                    rps=args.rps_75pct,
+                    audit_frac=0.05,
+                    arrival_seed=seed,
+                    audit_mode="uniform",
+                    audit_action="cache_miss",
+                    audit_logprobs_k=1,
+                    out_dir=out_dir,
+                    run_name=f"cache_miss_5pct_s{seed}",
                 )
             )
             for k in (0, 1, 5):
@@ -847,6 +1125,7 @@ async def run_hunts(args: argparse.Namespace) -> None:
                         audit_frac=0.05,
                         arrival_seed=seed,
                         audit_mode="uniform",
+                        audit_action="logprobs",
                         audit_logprobs_k=k,
                         out_dir=out_dir,
                         run_name=f"audit5pct_k{k}_s{seed}",
@@ -902,8 +1181,10 @@ def main() -> None:
     p_single.add_argument("--rps", type=float, required=True)
     p_single.add_argument("--audit-frac", type=float, default=0.0)
     p_single.add_argument("--audit-mode", choices=["uniform", "early", "late"], default="uniform")
+    p_single.add_argument("--audit-action", choices=["logprobs", "cache_miss"], default="logprobs")
     p_single.add_argument("--audit-count", type=int, default=None)
     p_single.add_argument("--seed", type=int, default=101)
+    p_single.add_argument("--audit-seed", type=int, default=None)
     p_single.add_argument("--run-name", default=None)
 
     p_cal = sub.add_parser("calibrate", help="Measure 100% baseline capacity at 0% auditing")
@@ -927,7 +1208,7 @@ def main() -> None:
 
     args = parser.parse_args()
     if args.cmd == "single":
-        name = args.run_name or f"single_{args.audit_mode}_a{int(round(args.audit_frac*100))}_rps{args.rps:.2f}_s{args.seed}"
+        name = args.run_name or f"single_{args.audit_mode}_{args.audit_action}_a{int(round(args.audit_frac*100))}_rps{args.rps:.2f}_s{args.seed}"
         asyncio.run(
             run_single(
                 base_url=args.base_url,
@@ -936,8 +1217,10 @@ def main() -> None:
                 audit_frac=args.audit_frac,
                 arrival_seed=args.seed,
                 audit_mode=args.audit_mode,
+                audit_action=args.audit_action,
                 audit_count=args.audit_count,
                 audit_logprobs_k=args.audit_logprobs_k,
+                audit_seed=args.audit_seed,
                 num_sessions=args.num_sessions,
                 num_turns=args.num_turns,
                 num_streaming_sessions=args.num_streaming_sessions,

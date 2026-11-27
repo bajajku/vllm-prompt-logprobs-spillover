@@ -13,41 +13,44 @@ Empirical vLLM `v0.34.0` serving benchmark measuring cross-cohort tail-latency s
 
 ## Experimental Design
 
-- **Server**: `vllm==0.34.0` serving `Qwen/Qwen2.5-3B-Instruct` in `bfloat16` on 1× NVIDIA A100-SXM4-80GB (`GPU 0`, port `8025`).
-- **Workload**: 24 seeded, 32-turn sessions (768 total turns), each with a distinct 4,096-token starting history (primed during fixed warm-up) and 128 new tokens appended per turn (`4,224 -> 8,192` prompt tokens), fixed `output_tokens=64`, `ignore_eos=True`, `temperature=0.0`.
-- **Cohort Isolation**:
-  - **Sessions 0–15 (512 turns)**: Separate, unscored streaming measurement cohort (`stream=True`, never audited across any condition).
-  - **Sessions 16–23 (256 turns)**: Nonstreaming audit/control pool (`stream=False` in all conditions). Audited turns are nested subsets (`1% ⊂ 5% ⊂ 10%`) of this pool, paired against exact nonstreaming matched controls at `0%`.
+- **Server**: `vllm==0.34.0` serving `Qwen/Qwen2.5-3B-Instruct` in `bfloat16` on 1× NVIDIA A100-SXM4-80GB (`GPU 0`, port `8025`), `--enable-prefix-caching`, `--generation-config vllm` (with explicit `repetition_penalty=1.0` so HF's `generation_config.json` does not add repetition-penalty compute), and pre-warmed `prompt_logprobs` Triton kernels (`k ∈ {0, 1, 5}`) before prefix-cache reset and timing.
+- **Workload**: 24 seeded, 32-turn sessions (768 total turns) with **staggered starting turn depths** across sessions (and pre-primed rollover histories) so the aggregate prompt-length distribution is stationary across the entire replay (`4,224 -> 8,192` prompt tokens, exact `6,208.0` mean prompt tokens per quarter), fixed `output_tokens=64`, `ignore_eos=True`, `temperature=0.0`.
+- **Cohort & Client Isolation**:
+  - **Sessions 0–15 (512 turns)**: Separate, unscored streaming measurement cohort (`stream=True`, never audited across any condition), executed in its **own isolated OS process** synchronized via `CLOCK_MONOTONIC` so nonstreaming logprob payload downloads/JSON decoding cannot stall streaming timers or SSE reads.
+  - **Sessions 16–23 (256 turns)**: Nonstreaming audit/control pool (`stream=False` in all conditions, with JSON parsing deferred strictly post-run). Audited turns are nested subsets (`1% ⊂ 5% ⊂ 10%`) within each replicate, paired against exact nonstreaming matched controls at `0%` and a `5%` **cache-miss-only control** (token 0 mutated, `prompt_logprobs` unset). `audit_seed` varies across replicates (`9000 + arrival_seed`).
 - **Arrival Schedule**: Stationary round-robin turn-shuffled Poisson arrivals (fixed per arrival seed: `101, 202, 303`) with boundary separation so consecutive turns of the same session do not collide and there is no ramp-down tail bias.
 - **Metrics**:
-  - Client-side per-request TTFT, E2E, TPOT, TTFB, body transfer time, and response payload bytes (`requests.jsonl`).
+  - Client-side per-request TTFT, E2E, TPOT (`(t_end - t_first) / (completion_tokens - 1)`), TTFB, body transfer time, dispatch lag, and response payload bytes (`requests.jsonl`).
   - Server-side Prometheus `/metrics` deltas before/after each replay: `vllm:prefix_cache_hits` / `vllm:prefix_cache_queries` (reported hit ratio), `vllm:request_prefill_kv_computed_tokens_sum` & `vllm:prompt_tokens_by_source{source="computed"}` (newly computed prefill tokens), `vllm:num_preemptions`, and fine-grained latency histograms (`server_ttft_s`, `server_queue_s`, `server_prefill_s`, `server_e2e_s`).
 
 ## Empirical Results (`vllm==0.34.0`, `Qwen/Qwen2.5-3B-Instruct`, 1× A100-SXM4-80GB)
 
-All **73 benchmark runs** (56,064 total requests across calibration, main sweep, and 3 diagnostic hunts) completed with **0 errors** and **0 KV-cache preemptions**.
+All **76 benchmark runs** (58,368 total requests across calibration, main sweep, and 3 diagnostic hunts) completed with **0 errors**, **0 KV-cache preemptions**, **0 HF `generation_config` overrides**, and **0 mid-run Triton JIT compilations** (JIT completed during pre-timing warmup). Streaming client dispatch lag remained tight (`dlag_p95 = 1.9–2.7 ms` across steady-state runs and `2.45 ms` even at `k=5`).
 
-- **Baseline Capacity Calibration (0% audit, SLO p95 TTFT ≤ 500 ms):** **`24.0 req/s`** (`p95 = 124.1 ms` at `24 req/s`, crossing the SLO at `28 req/s` with `p95 = 506.4 ms`).
+- **Baseline Capacity Calibration (0% audit, SLO p95 TTFT ≤ 500 ms):** **`24.0 req/s`** (`p95 = 161.1 ms` at `24 req/s`, transitioning into overload at `28 req/s`).
 - **Target 75% Load:** **`18.0 req/s`**.
 
 ### Main Sweep: Audit Fraction vs. Unscored Streaming Cohort (`18.0 req/s`, 3 seeds)
 
 ![Money Chart](plots/money_chart.png)
 
-| Audit % | Unscored p50 TTFT | Unscored p95 TTFT (mean ± SD) | vs. 0% Baseline | Reported Hit % | True Effective Hit % | Newly Computed Prefill |
-|---:|---:|---:|---:|---:|---:|---:|
-| **0%** | 61.6 ms | **93.8 ± 9.1 ms** | +0.0% | **97.94%** | 97.94% | 98,304 tok (1.0×) |
-| **1%** | 64.6 ms | **244.3 ± 34.5 ms** | **+160.3%** | **97.94%** | 96.98% | 144,000 tok (1.5×) |
-| **5%** | 164.6 ms | **757.0 ± 212.0 ms** | **+706.6%** | **97.94%** | 93.16% | 326,144 tok (3.3×) |
-| **10%** | 440.3 ms | **10,209.7 ± 1,615.3 ms** | **+10,778.9%** | **97.94%** | 88.00% | 572,160 tok (5.8×) |
+| Audit % | Unscored p50 TTFT | Unscored p95 TTFT (mean ± SD) | vs. 0% Baseline | Reported Hit % | True Effective Hit % | Newly Computed Prefill | Achieved RPS | Regime |
+|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| **0%** | 62.2 ms | **95.4 ± 8.9 ms** | +0.0% | **97.94%** | 97.94% | 98,304 tok (1.0×) | 17.84 | steady |
+| **1%** | 64.5 ms | **266.2 ± 28.3 ms** | **+179.1%** | **97.94%** | 96.97% | 144,555 tok (1.5×) | 17.76 | steady |
+| **5%** | 138.8 ms | **594.4 ± 71.6 ms** | **+523.3%** | **97.94%** | 93.10% | 329,131 tok (3.3×) | 17.40 | steady |
+| **10%** | 5,221.4 ms | **15,033.0 ± 3,005.6 ms** | **+15,664.4%** | **97.94%** | 88.08% | 568,192 tok (5.8×) | 12.42 | **UNSTABLE** |
 
-**Hypothesis verdict — strongly confirmed:** At 75% load, auditing **5% of turns** raised unscored streaming **p95 TTFT by +706.6% (8.1×)** while newly computed prefill tokens jumped **3.3×** and the reported prefix-cache hit rate moved by **0.00 percentage points (`97.94% → 97.94%`)**.
+**Hypothesis verdict — strongly confirmed:** At 75% load, auditing **5% of turns** raised unscored streaming **p95 TTFT by +523.3% (6.2×)** in steady state while newly computed prefill tokens jumped **3.3×** and the reported prefix-cache hit rate moved by **0.00 percentage points (`97.94% → 97.94%`)**. At **10% auditing**, the server entered queueing collapse (`achieved_rps = 12.42 < 0.90 × 18.0`), yet Prometheus still reported **97.94%**.
 
 ### Diagnostic Hunts
 
-1. **Hunt 1 — Early vs. Late Turns ([hunt1_early_vs_late.png](plots/hunt1_early_vs_late.png)):** Auditing just **10 late turns** (1.3% of turns, `176K` new prefill tokens) raised unscored p95 TTFT to **665.9 ms (+592.3%)**—worse than auditing **24 early turns** (3.1% of turns, `209K` new prefill tokens, **422.4 ms / +339.1%**).
-2. **Hunt 2 — GPU Contention vs. Logprob Serialization ([hunt2_serialization_gap.png](plots/hunt2_serialization_gap.png)):** Even at `prompt_logprobs=0` (`0.47 MB` payload), server Prometheus p95 TTFT jumped **10×** (`72.5 ms → 745.5 ms`, client p95 `856.8 ms`), proving GPU prefill/queue contention is the primary driver. Increasing to `k=5` (`2.41 MB` payload) kept server TTFT flat (`715.5 ms`) while pushing client p95 to `1,030.9 ms` and client p50 from `162.5 ms → 377.5 ms`, exposing a secondary API-server JSON serialization stall.
-3. **Hunt 3 — Load Boundary ([hunt3_load_boundary.png](plots/hunt3_load_boundary.png)):** 5% auditing severely degraded unscored p95 TTFT across every tested load: **+388.5%** at 35% load (`70.0 → 341.9 ms`), **+455.6%** at 50% load (`75.1 → 417.5 ms`), **+682.4%** at 75% load (`97.7 → 764.3 ms`), and **+869.5%** at 90% load (`172.1 → 1,668.0 ms`).
+1. **Hunt 1 — Early vs. Late Turns ([hunt1_early_vs_late.png](plots/hunt1_early_vs_late.png)):** With stationary turn depths across time, auditing just **10 late turns** (1.3% of turns, `176K` new prefill tokens) raised unscored p95 TTFT to **423.4 ± 22.9 ms (+358.5%)**—worse than auditing **36 early turns** (4.7% of turns, `260K` new prefill tokens, **360.4 ± 24.8 ms / +290.3%**) or **24 early turns** (**321.8 ± 22.2 ms / +248.5%**).
+2. **Hunt 2 — Mechanism Decomposition: Cache Bypass vs. Logprobs Compute & Server Serialization ([hunt2_serialization_gap.png](plots/hunt2_serialization_gap.png)):** With the streaming cohort isolated in its own OS process (`dlag_p95 = 2.45 ms` at `k=5`):
+   - **`cache_miss_5pct`** (token 0 mutated, no `prompt_logprobs`): Unscored p95 TTFT reached **`333.6 ms` / `461.8 ms` / `2,339.3 ms`** across seeds (median `461.8 ms`, mean `1,044.9 ms`), showing pure prefix-cache bypass accounts for the bulk of `k=0`/`k=1` spillover—**while Prometheus accurately reports the hit-rate drop (`97.94% → 93.01%`)**.
+   - **`audit5pct_k0` & `audit5pct_k1`** (`0.48 MB` / `0.87 MB`): Client p95 = **`582.0 ± 151.8 ms`** / **`602.5 ± 73.3 ms`**, closely tracking server Prometheus p95 (`525.2 ms` / `493.3 ms`)—while Prometheus goes **100% blind (`97.94%`)**.
+   - **`audit5pct_k5`** (`2.44 MB` per audited turn): Client p95 surged to **`1,297.6 ± 395.6 ms`** (client p50 `389.6 ms`) vs. server Prometheus p95 **`886.0 ms`**—a genuine **`+412 ms` vLLM API-server serialization / event-loop stall** cleanly separated from client-side parsing.
+3. **Hunt 3 — Load Boundary ([hunt3_load_boundary.png](plots/hunt3_load_boundary.png)):** 5% auditing severely degraded unscored p95 TTFT across every tested load: **+425.0%** at 35% load (`68.0 → 356.9 ms`), **+496.8%** at 50% load (`73.5 → 438.7 ms`), **+554.7%** at 75% load (`92.5 → 605.7 ms`), and queueing collapse (**+4,521.6%**, `155.6 → 7,189.2 ms`, all 3 seeds unstable) at 90% load.
 
 ## Environment Requirements
 

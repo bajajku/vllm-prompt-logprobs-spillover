@@ -33,6 +33,7 @@ exec "${VENV_BIN}/vllm" serve "${MODEL}" \
   --port "${PORT}" \
   --tensor-parallel-size 1 \
   --enable-prefix-caching \
+  --generation-config vllm \
   --max-model-len "${MAX_MODEL_LEN}" \
   --gpu-memory-utilization "${GPU_MEM_UTIL}" \
   --custom-histogram-buckets "${CUSTOM_BUCKETS}" \

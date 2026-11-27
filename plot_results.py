@@ -52,6 +52,7 @@ def plot_money_chart(results_dir: Path, out_dir: Path) -> None:
 
     p95_means, p95_stds, p95_per_seed = [], [], []
     hit_means, true_hit_means, prefill_means = [], [], []
+    unstable_flags, ach_rps_means = [], []
 
     for f in fracs:
         group = by_frac[f]
@@ -67,30 +68,64 @@ def plot_money_chart(results_dir: Path, out_dir: Path) -> None:
             if g["server_metrics"]["true_effective_cache_hit_ratio"] is not None
         ]
         prefills = [g["server_metrics"]["newly_computed_prefill_tokens"] or 0.0 for g in group]
+        ach_rpss = [g["timing"]["achieved_rps"] for g in group]
+        ach_mean = float(np.mean(ach_rpss))
         p95_per_seed.append(p95s)
         p95_means.append(float(np.mean(p95s)))
         p95_stds.append(float(np.std(p95s, ddof=1)) if len(p95s) > 1 else 0.0)
         hit_means.append(float(np.mean(hits)) if hits else float("nan"))
         true_hit_means.append(float(np.mean(thits)) if thits else float("nan"))
         prefill_means.append(float(np.mean(prefills)))
+        ach_rps_means.append(ach_mean)
+        unstable_flags.append(ach_mean < 0.90 * rps)
 
-    fig, ax = plt.subplots(figsize=(9.5, 5.8), dpi=180)
-    # Plot individual seeds faintly + mean curve with error bars.
-    for xi, ys in zip(x_pct, p95_per_seed):
-        ax.scatter([xi] * len(ys), ys, color="#1f77b4", alpha=0.45, s=36, zorder=3)
+    fig, ax = plt.subplots(figsize=(10.2, 6.2), dpi=180)
+    # Plot individual seeds faintly.
+    for xi, ys, unst in zip(x_pct, p95_per_seed, unstable_flags):
+        col = "#c0392b" if unst else "#1f77b4"
+        ax.scatter([xi] * len(ys), ys, color=col, alpha=0.45, s=36, zorder=3)
 
-    ax.errorbar(
-        x_pct,
-        p95_means,
-        yerr=p95_stds,
-        fmt="-o",
-        color="#0b4f8a",
-        linewidth=2.4,
-        markersize=8,
-        capsize=5,
-        zorder=4,
-        label="Unscored cohort p95 TTFT (mean ± SD across seeds)",
-    )
+    # Connect stable points with solid line, transition to unstable with dashed line.
+    stable_idx = [i for i, u in enumerate(unstable_flags) if not u]
+    unstable_idx = [i for i, u in enumerate(unstable_flags) if u]
+    if stable_idx:
+        ax.errorbar(
+            [x_pct[i] for i in stable_idx],
+            [p95_means[i] for i in stable_idx],
+            yerr=[p95_stds[i] for i in stable_idx],
+            fmt="-o",
+            color="#0b4f8a",
+            linewidth=2.4,
+            markersize=8,
+            capsize=5,
+            zorder=4,
+            label="Unscored cohort p95 TTFT — steady state (mean ± SD)",
+        )
+    if unstable_idx:
+        bridge = [stable_idx[-1], unstable_idx[0]] if stable_idx else []
+        if bridge:
+            ax.plot(
+                [x_pct[i] for i in bridge],
+                [p95_means[i] for i in bridge],
+                linestyle="--",
+                color="#c0392b",
+                linewidth=2.0,
+                zorder=3,
+            )
+        ax.errorbar(
+            [x_pct[i] for i in unstable_idx],
+            [p95_means[i] for i in unstable_idx],
+            yerr=[p95_stds[i] for i in unstable_idx],
+            fmt="--D",
+            color="#c0392b",
+            markerfacecolor="white",
+            markeredgewidth=2.0,
+            linewidth=2.2,
+            markersize=8.5,
+            capsize=5,
+            zorder=4,
+            label="Overloaded / queue-diverging (achieved RPS < 90% target)",
+        )
 
     # Hypothesis +20% reference line relative to 0% baseline.
     base_p95 = p95_means[0]
@@ -98,41 +133,54 @@ def plot_money_chart(results_dir: Path, out_dir: Path) -> None:
     ax.axhline(
         thresh_p95,
         color="#c0392b",
-        linestyle="--",
-        linewidth=1.3,
-        alpha=0.8,
+        linestyle=":",
+        linewidth=1.4,
+        alpha=0.85,
         label=f"+20% hypothesis threshold ({thresh_p95:.1f} ms)",
     )
 
-    y_span = max(p95_means) - min(p95_means)
-    y_pad = max(y_span * 0.14, base_p95 * 0.08, 12.0)
+    ax.set_yscale("log")
+    y_min = max(30.0, min(p95_means) * 0.45)
+    y_max = max(p95_means) * 3.8
+    ax.set_ylim(y_min, y_max)
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{int(v):,}" if v >= 1 else f"{v:g}"))
 
-    for idx, (xi, yi, hit_r, true_r, ptok) in enumerate(
-        zip(x_pct, p95_means, hit_means, true_hit_means, prefill_means)
+    # Carefully placed non-overlapping callouts in log space.
+    offsets_pts = [
+        (42, 26),    # 0%: up-right (stays clear of x-axis ticks)
+        (48, 42),    # 1%: further up-right
+        (-8, 42),    # 5%: directly above
+        (-54, -46),  # 10%: down-left so it never clips the top edge
+    ]
+    for idx, (xi, yi, hit_r, true_r, ptok, unst) in enumerate(
+        zip(x_pct, p95_means, hit_means, true_hit_means, prefill_means, unstable_flags)
     ):
         rel = ((yi / base_p95) - 1.0) * 100.0 if base_p95 > 0 else 0.0
         sign = "+" if rel >= 0 else ""
+        status_tag = "\n[UNSTABLE / OVERLOADED]" if unst else ""
         label_txt = (
-            f"{yi:.0f} ms ({sign}{rel:.0f}%)\n"
-            f"Reported hit: {hit_r:.1f}%\n"
+            f"{yi:,.0f} ms ({sign}{rel:,.0f}%){status_tag}\n"
+            f"Reported hit: {hit_r:.1f}% (true {true_r:.1f}%)\n"
             f"New prefill: {fmt_tokens(ptok)} tok"
         )
-        y_offset = y_pad if idx % 2 == 0 else y_pad * 1.15
-        va = "bottom"
+        dx, dy = offsets_pts[idx] if idx < len(offsets_pts) else (0, 34)
+        ec = "#c0392b" if unst else "#adb5bd"
+        fc = "#fff5f5" if unst else "#f8f9fa"
         ax.annotate(
             label_txt,
             xy=(xi, yi),
-            xytext=(xi, yi + y_offset),
+            xytext=(dx, dy),
+            textcoords="offset points",
             ha="center",
-            va=va,
-            fontsize=8.5,
-            bbox=dict(boxstyle="round,pad=0.35", fc="#f8f9fa", ec="#adb5bd", lw=0.9),
+            va="center",
+            fontsize=8.3,
+            bbox=dict(boxstyle="round,pad=0.35", fc=fc, ec=ec, lw=1.0),
             arrowprops=dict(arrowstyle="->", color="#6c757d", lw=0.9),
             zorder=5,
         )
 
     ax.set_xlabel("Audited Turn Fraction (% of all turns with prompt_logprobs)", fontsize=11)
-    ax.set_ylabel("Unscored Cohort p95 TTFT (ms)", fontsize=11)
+    ax.set_ylabel("Unscored Cohort p95 TTFT (ms, log scale)", fontsize=11)
     ax.set_title(
         f"Audit Spillover in vLLM v0.34.0 (Qwen2.5-3B-Instruct BF16, 75% Load = {rps:.2f} req/s)\n"
         "Reported Prefix-Cache Hit Rate Stays Flat While GPU Prefill Work & Unscored Tail Latency Surge",
@@ -141,10 +189,9 @@ def plot_money_chart(results_dir: Path, out_dir: Path) -> None:
     )
     ax.set_xticks(x_pct)
     ax.set_xticklabels([f"{x:.0f}%" for x in x_pct])
-    ax.set_xlim(-0.8, max(x_pct) + 1.2)
-    ax.set_ylim(0, max(p95_means) + y_pad * 3.1)
-    ax.grid(True, linestyle=":", alpha=0.5)
-    ax.legend(loc="upper left", frameon=True, fontsize=9)
+    ax.set_xlim(-0.8, max(x_pct) + 1.4)
+    ax.grid(True, which="both", linestyle=":", alpha=0.45)
+    ax.legend(loc="upper left", frameon=True, fontsize=8.8)
     fig.tight_layout()
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -155,11 +202,20 @@ def plot_money_chart(results_dir: Path, out_dir: Path) -> None:
 
     # Print concise hypothesis check table.
     print("\n=== Money Chart Summary ===")
-    print(f"{'Audit%':>7} | {'p95 TTFT (ms)':>14} | {'vs 0%':>8} | {'Rep Hit%':>9} | {'True Hit%':>10} | {'New Prefill':>12}")
-    print("-" * 74)
-    for xi, yi, sd, hr, tr, pt in zip(x_pct, p95_means, p95_stds, hit_means, true_hit_means, prefill_means):
+    print(
+        f"{'Audit%':>7} | {'p95 TTFT (ms)':>16} | {'vs 0%':>9} | {'Rep Hit%':>9} | "
+        f"{'True Hit%':>10} | {'New Prefill':>12} | {'Ach RPS':>8} | {'Status':>10}"
+    )
+    print("-" * 100)
+    for xi, yi, sd, hr, tr, pt, ar, unst in zip(
+        x_pct, p95_means, p95_stds, hit_means, true_hit_means, prefill_means, ach_rps_means, unstable_flags
+    ):
         rel = ((yi / base_p95) - 1.0) * 100.0 if base_p95 > 0 else 0.0
-        print(f"{xi:6.1f}% | {yi:7.1f} ± {sd:4.1f} | {rel:+7.1f}% | {hr:8.2f}% | {tr:9.2f}% | {pt:12,.0f}")
+        st = "UNSTABLE" if unst else "steady"
+        print(
+            f"{xi:6.1f}% | {yi:7.1f} ± {sd:6.1f} | {rel:+8.1f}% | {hr:8.2f}% | "
+            f"{tr:9.2f}% | {pt:12,.0f} | {ar:8.2f} | {st:>10}"
+        )
 
 
 def plot_hunt1(results_dir: Path, out_dir: Path) -> None:
@@ -182,21 +238,22 @@ def plot_hunt1(results_dir: Path, out_dir: Path) -> None:
     ]
     prefills = [float(np.mean([g["server_metrics"]["newly_computed_prefill_tokens"] or 0.0 for g in groups[k]])) for k in order]
 
-    fig, ax = plt.subplots(figsize=(8.2, 4.8), dpi=180)
+    fig, ax = plt.subplots(figsize=(8.6, 5.1), dpi=180)
     colors = ["#7f8c8d", "#2980b9", "#1f618d", "#d35400", "#a04000"][: len(order)]
     bars = ax.bar(order, means, yerr=stds, capsize=5, color=colors, alpha=0.9)
-    for b, m, pt in zip(bars, means, prefills):
+    top_max = max(m + sd for m, sd in zip(means, stds))
+    for b, m, sd, pt in zip(bars, means, stds, prefills):
         ax.text(
             b.get_x() + b.get_width() / 2,
-            m + max(means) * 0.03,
+            m + sd + top_max * 0.03,
             f"{m:.0f} ms\n({fmt_tokens(pt)})",
             ha="center",
             va="bottom",
             fontsize=8.5,
         )
     ax.set_ylabel("Unscored Cohort p95 TTFT (ms)")
-    ax.set_title("Hunt 1: Early-Turn vs Late-Turn Audits (at 75% Load)")
-    ax.set_ylim(0, max(means) * 1.28)
+    ax.set_title("Hunt 1: Early-Turn vs Late-Turn Audits (Stationary Depth, 75% Load)")
+    ax.set_ylim(0, top_max * 1.24)
     ax.grid(axis="y", linestyle=":", alpha=0.5)
     fig.tight_layout()
     fig.savefig(out_dir / "hunt1_early_vs_late.png", dpi=200)
@@ -214,7 +271,11 @@ def plot_hunt2(results_dir: Path, out_dir: Path) -> None:
         label = r["run_name"].rsplit("_s", 1)[0]
         groups[label].append(r)
 
-    order = [k for k in ["baseline_0pct", "audit5pct_k0", "audit5pct_k1", "audit5pct_k5"] if k in groups]
+    order = [
+        k
+        for k in ["baseline_0pct", "cache_miss_5pct", "audit5pct_k0", "audit5pct_k1", "audit5pct_k5"]
+        if k in groups
+    ]
     client_p95 = [float(np.mean([g["streaming_unscored"]["ttft_ms"]["p95"] for g in groups[k]])) for k in order]
     srv_ttft_p95 = [
         float(np.mean([(g["server_metrics"]["server_ttft_s"]["p95"] or 0.0) * 1000.0 for g in groups[k]]))
@@ -228,17 +289,27 @@ def plot_hunt2(results_dir: Path, out_dir: Path) -> None:
         float(np.mean([(g["nonstreaming_audited"]["response_bytes"]["mean"] or 0.0) / (1024 * 1024) for g in groups[k]]))
         for k in order
     ]
+    rep_hits = [
+        float(np.mean([(g["server_metrics"]["reported_cache_hit_ratio"] or 0.0) * 100.0 for g in groups[k]]))
+        for k in order
+    ]
 
     x = np.arange(len(order))
     w = 0.25
-    fig, ax = plt.subplots(figsize=(8.8, 5.0), dpi=180)
+    fig, ax = plt.subplots(figsize=(10.2, 5.3), dpi=180)
     ax.bar(x - w, client_p95, w, label="Client Unscored p95 TTFT (ms)", color="#0b4f8a")
     ax.bar(x, srv_ttft_p95, w, label="Server Prometheus p95 TTFT (ms)", color="#27ae60")
     ax.bar(x + w, srv_q_p95, w, label="Server Prometheus p95 Queue (ms)", color="#e67e22")
     ax.set_xticks(x)
-    ax.set_xticklabels([f"{k}\n(audit payload: {mb:.2f} MB)" for k, mb in zip(order, payload_mb)], fontsize=8.5)
+    ax.set_xticklabels(
+        [
+            f"{k}\n{mb:.2f} MB\nrep hit: {rh:.1f}%"
+            for k, mb, rh in zip(order, payload_mb, rep_hits)
+        ],
+        fontsize=8.5,
+    )
     ax.set_ylabel("Latency (ms)")
-    ax.set_title("Hunt 2: Logprob Payload Serialization Overhead vs Server Queue/TTFT")
+    ax.set_title("Hunt 2: Mechanism Decomposition — Cache Bypass vs. Logprobs Compute & Server Serialization")
     ax.grid(axis="y", linestyle=":", alpha=0.5)
     ax.legend(frameon=True, fontsize=9)
     fig.tight_layout()
