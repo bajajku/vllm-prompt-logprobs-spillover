@@ -276,15 +276,19 @@ def plot_hunt2(results_dir: Path, out_dir: Path) -> None:
         for k in ["baseline_0pct", "cache_miss_5pct", "audit5pct_k0", "audit5pct_k1", "audit5pct_k5"]
         if k in groups
     ]
-    client_p95 = [float(np.mean([g["streaming_unscored"]["ttft_ms"]["p95"] for g in groups[k]])) for k in order]
-    srv_ttft_p95 = [
-        float(np.mean([(g["server_metrics"]["server_ttft_s"]["p95"] or 0.0) * 1000.0 for g in groups[k]]))
+    client_seeds = [[g["streaming_unscored"]["ttft_ms"]["p95"] for g in groups[k]] for k in order]
+    srv_ttft_seeds = [
+        [(g["server_metrics"]["server_ttft_s"]["p95"] or 0.0) * 1000.0 for g in groups[k]]
         for k in order
     ]
-    srv_q_p95 = [
-        float(np.mean([(g["server_metrics"]["server_queue_s"]["p95"] or 0.0) * 1000.0 for g in groups[k]]))
+    srv_q_seeds = [
+        [(g["server_metrics"]["server_queue_s"]["p95"] or 0.0) * 1000.0 for g in groups[k]]
         for k in order
     ]
+
+    client_p95 = [float(np.median(vals)) for vals in client_seeds]
+    srv_ttft_p95 = [float(np.median(vals)) for vals in srv_ttft_seeds]
+    srv_q_p95 = [float(np.median(vals)) for vals in srv_q_seeds]
     payload_mb = [
         float(np.mean([(g["nonstreaming_audited"]["response_bytes"]["mean"] or 0.0) / (1024 * 1024) for g in groups[k]]))
         for k in order
@@ -296,10 +300,75 @@ def plot_hunt2(results_dir: Path, out_dir: Path) -> None:
 
     x = np.arange(len(order))
     w = 0.25
-    fig, ax = plt.subplots(figsize=(10.6, 5.8), dpi=180)
-    ax.bar(x - w, client_p95, w, label="Client Unscored p95 TTFT — 512 streaming reqs only", color="#0b4f8a")
-    ax.bar(x, srv_ttft_p95, w, label="Server Prometheus p95 TTFT — all 768 reqs (incl. audited)", color="#27ae60")
-    ax.bar(x + w, srv_q_p95, w, label="Server Prometheus p95 Queue — all 768 reqs (incl. audited)", color="#e67e22")
+    fig, ax = plt.subplots(figsize=(10.8, 6.0), dpi=180)
+    ax.bar(
+        x - w,
+        client_p95,
+        w,
+        label="Client Unscored p95 TTFT — 512 streaming reqs only (median bar + seed dots)",
+        color="#0b4f8a",
+        alpha=0.88,
+        zorder=2,
+    )
+    ax.bar(
+        x,
+        srv_ttft_p95,
+        w,
+        label="Server Prometheus p95 TTFT — all 768 reqs, incl. audited (median bar + seed dots)",
+        color="#27ae60",
+        alpha=0.88,
+        zorder=2,
+    )
+    ax.bar(
+        x + w,
+        srv_q_p95,
+        w,
+        label="Server Prometheus p95 Queue — all 768 reqs, incl. audited (median bar)",
+        color="#e67e22",
+        alpha=0.88,
+        zorder=2,
+    )
+
+    # Overlay individual per-seed points so excursions (e.g. cache_miss_5pct s202) are transparent.
+    for idx in range(len(order)):
+        c_vals = client_seeds[idx]
+        s_vals = srv_ttft_seeds[idx]
+        jitter = np.linspace(-0.04, 0.04, len(c_vals)) if len(c_vals) > 1 else np.array([0.0])
+        ax.scatter(
+            (x[idx] - w) + jitter,
+            c_vals,
+            color="#062c4d",
+            edgecolor="white",
+            linewidth=0.7,
+            s=34,
+            zorder=4,
+        )
+        ax.scatter(
+            x[idx] + jitter,
+            s_vals,
+            color="#145a32",
+            edgecolor="white",
+            linewidth=0.7,
+            s=34,
+            zorder=4,
+        )
+
+    # Annotate any extreme metastable excursion dot cleanly (e.g., cache_miss_5pct s202).
+    if "cache_miss_5pct" in order:
+        cm_i = order.index("cache_miss_5pct")
+        cm_max = max(client_seeds[cm_i])
+        if cm_max > 2.0 * client_p95[cm_i]:
+            ax.annotate(
+                f"s202 metastable excursion\n(client {cm_max:,.0f} ms / srv {max(srv_ttft_seeds[cm_i]):,.0f} ms)",
+                xy=(x[cm_i] - w, cm_max),
+                xytext=(x[cm_i] + 0.55, cm_max + 80),
+                fontsize=7.8,
+                color="#495057",
+                bbox=dict(boxstyle="round,pad=0.25", fc="#fff8e1", ec="#d4ac0d", lw=0.8),
+                arrowprops=dict(arrowstyle="->", color="#7f8c8d", lw=0.8),
+                zorder=5,
+            )
+
     ax.set_xticks(x)
     ax.set_xticklabels(
         [
@@ -310,17 +379,30 @@ def plot_hunt2(results_dir: Path, out_dir: Path) -> None:
     )
     ax.set_ylabel("Latency (ms)")
     ax.set_title(
-        "Hunt 2: Mechanism Decomposition — Cache Bypass vs. Logprobs Compute & Server Serialization",
+        "Hunt 2: Mechanism Decomposition — Cache Bypass vs. Logprobs Compute & Server Serialization\n"
+        "(Bars = 3-Seed Medians; Dots = Individual Seeds)",
         pad=10,
     )
-    ax.set_ylim(0, max(client_p95 + srv_ttft_p95) * 1.15)
+    all_max = max(max(v) for v in client_seeds + srv_ttft_seeds)
+    ax.set_ylim(0, all_max * 1.15)
     ax.grid(axis="y", linestyle=":", alpha=0.5)
-    ax.legend(loc="upper center", frameon=True, fontsize=8.4)
+    ax.legend(loc="upper right", frameon=True, fontsize=8.1)
+
+    gap_clause = "making the client-over-server gap at k=5 a conservative lower bound."
+    if "audit5pct_k5" in order:
+        k5_i = order.index("audit5pct_k5")
+        k5_med_gap = client_p95[k5_i] - srv_ttft_p95[k5_i]
+        k5_mean_gap = float(np.mean(client_seeds[k5_i]) - np.mean(srv_ttft_seeds[k5_i]))
+        gap_clause = (
+            f"making the +{k5_med_gap:.0f} ms median (+{k5_mean_gap:.0f} ms mean) "
+            "client-over-server gap at k=5 a conservative lower bound."
+        )
+
     fig.text(
         0.5,
         0.01,
         "Note: Prometheus histograms aggregate all 768 requests (including the 38 audited turns), whereas Client Unscored measures only the 512 streaming turns.\n"
-        "Including slow audited turns pushes Server p95 upward (visible in cache_miss_5pct), making the +412 ms client-over-server gap at k=5 a conservative lower bound.",
+        f"Including slow audited turns pushes Server p95 upward (visible in cache_miss_5pct), {gap_clause}",
         ha="center",
         va="bottom",
         fontsize=7.8,
