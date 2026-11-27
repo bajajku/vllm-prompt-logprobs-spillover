@@ -828,6 +828,11 @@ async def run_single(
             ks=tuple(sorted({0, 1, 5, audit_logprobs_k})),
         )
         cache_reset_ok = await reset_prefix_cache(client, base_url)
+        if not cache_reset_ok:
+            raise RuntimeError(
+                f"POST {base_url}/reset_prefix_cache failed. "
+                "Start vLLM with VLLM_SERVER_DEV_MODE=1 to guarantee inter-run prefix-cache isolation."
+            )
         warmup_s = await warmup_sessions(client, base_url, model, warmup_prefixes)
         await asyncio.sleep(2.0)
         metrics_before = await fetch_metrics(client, base_url)

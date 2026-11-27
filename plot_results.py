@@ -296,10 +296,10 @@ def plot_hunt2(results_dir: Path, out_dir: Path) -> None:
 
     x = np.arange(len(order))
     w = 0.25
-    fig, ax = plt.subplots(figsize=(10.2, 5.3), dpi=180)
-    ax.bar(x - w, client_p95, w, label="Client Unscored p95 TTFT (ms)", color="#0b4f8a")
-    ax.bar(x, srv_ttft_p95, w, label="Server Prometheus p95 TTFT (ms)", color="#27ae60")
-    ax.bar(x + w, srv_q_p95, w, label="Server Prometheus p95 Queue (ms)", color="#e67e22")
+    fig, ax = plt.subplots(figsize=(10.6, 5.8), dpi=180)
+    ax.bar(x - w, client_p95, w, label="Client Unscored p95 TTFT — 512 streaming reqs only", color="#0b4f8a")
+    ax.bar(x, srv_ttft_p95, w, label="Server Prometheus p95 TTFT — all 768 reqs (incl. audited)", color="#27ae60")
+    ax.bar(x + w, srv_q_p95, w, label="Server Prometheus p95 Queue — all 768 reqs (incl. audited)", color="#e67e22")
     ax.set_xticks(x)
     ax.set_xticklabels(
         [
@@ -309,10 +309,25 @@ def plot_hunt2(results_dir: Path, out_dir: Path) -> None:
         fontsize=8.5,
     )
     ax.set_ylabel("Latency (ms)")
-    ax.set_title("Hunt 2: Mechanism Decomposition — Cache Bypass vs. Logprobs Compute & Server Serialization")
+    ax.set_title(
+        "Hunt 2: Mechanism Decomposition — Cache Bypass vs. Logprobs Compute & Server Serialization",
+        pad=10,
+    )
+    ax.set_ylim(0, max(client_p95 + srv_ttft_p95) * 1.15)
     ax.grid(axis="y", linestyle=":", alpha=0.5)
-    ax.legend(frameon=True, fontsize=9)
-    fig.tight_layout()
+    ax.legend(loc="upper center", frameon=True, fontsize=8.4)
+    fig.text(
+        0.5,
+        0.01,
+        "Note: Prometheus histograms aggregate all 768 requests (including the 38 audited turns), whereas Client Unscored measures only the 512 streaming turns.\n"
+        "Including slow audited turns pushes Server p95 upward (visible in cache_miss_5pct), making the +412 ms client-over-server gap at k=5 a conservative lower bound.",
+        ha="center",
+        va="bottom",
+        fontsize=7.8,
+        color="#495057",
+        style="italic",
+    )
+    fig.tight_layout(rect=(0.0, 0.06, 1.0, 1.0))
     fig.savefig(out_dir / "hunt2_serialization_gap.png", dpi=200)
     plt.close(fig)
     print(f"[saved] {out_dir / 'hunt2_serialization_gap.png'}")
